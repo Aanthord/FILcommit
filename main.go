@@ -313,6 +313,11 @@ func DefaultWipeConfig() WipeConfig {
 // Wipe implementation
 // ============================================================================
 
+// alignedPrefix returns the largest offset <= size that is aligned to align.
+func alignedPrefix(size int64, align int64) int64 {
+	return size &^ (align - 1)
+}
+
 func wipeFile(ctx context.Context, tr *tracer, path string, size int64, cfg WipeConfig) error {
 	ctx, sp := tr.Start(ctx, "file.wipe", map[string]string{
 		"mode":   cfg.Mode.String(),
@@ -331,25 +336,17 @@ func wipeFile(ctx context.Context, tr *tracer, path string, size int64, cfg Wipe
 		return wipePunchHole(ctx, tr, path, size)
 	}
 
-	// Open with appropriate flags
-	flags := unix.O_WRONLY
+	// O_DIRECT tail problem: direct I/O requires aligned size.
+	// Strategy: wipe [0, alignedEnd) with O_DIRECT, [alignedEnd, size) buffered.
+	alignedEnd := size
 	if cfg.UseDirect {
-		flags |= unix.O_DIRECT
+		alignedEnd = alignedPrefix(size, int64(directAlign))
 	}
-
-	fd, err := unix.Open(path, flags, 0)
-	if err != nil {
-		return fmt.Errorf("open for wipe: %w", err)
-	}
-	defer unix.Close(fd)
-
-	// Advise sequential access
-	_ = adviseSequential(fd, 0, size)
+	hasTail := alignedEnd < size
 
 	// Allocate (possibly mlocked) buffer
-	// For O_DIRECT, must be aligned to directAlign
 	chunkSize := cfg.ChunkSize
-	if cfg.UseDirect {
+	if cfg.UseDirect && chunkSize%directAlign != 0 {
 		chunkSize = (chunkSize + directAlign - 1) &^ (directAlign - 1)
 	}
 
@@ -359,32 +356,74 @@ func wipeFile(ctx context.Context, tr *tracer, path string, size int64, cfg Wipe
 	}
 	defer secureFree(buf, cfg.UseMlock)
 
-	// Wipe passes
-	for pass := 0; pass < cfg.Passes; pass++ {
-		if err := wipePass(ctx, tr, fd, size, buf, cfg, pass); err != nil {
-			return fmt.Errorf("pass %d: %w", pass, err)
+	// Phase 1: O_DIRECT for aligned region (if any)
+	if alignedEnd > 0 {
+		flags := unix.O_WRONLY
+		if cfg.UseDirect {
+			flags |= unix.O_DIRECT
 		}
+
+		fd, err := unix.Open(path, flags, 0)
+		if err != nil {
+			return fmt.Errorf("open for wipe (direct): %w", err)
+		}
+
+		_ = adviseSequential(fd, 0, alignedEnd)
+
+		for pass := 0; pass < cfg.Passes; pass++ {
+			if err := wipeRegion(ctx, tr, fd, 0, alignedEnd, buf, cfg, pass); err != nil {
+				unix.Close(fd)
+				return fmt.Errorf("wipe aligned region pass %d: %w", pass, err)
+			}
+		}
+
+		if err := syncFile(fd, false); err != nil {
+			unix.Close(fd)
+			return fmt.Errorf("fdatasync (direct): %w", err)
+		}
+
+		if cfg.DropCache {
+			_ = adviseDontNeed(fd, 0, alignedEnd)
+		}
+
+		unix.Close(fd)
 	}
 
-	// Final sync
-	if err := syncFile(fd, true); err != nil {
-		return fmt.Errorf("fsync: %w", err)
-	}
+	// Phase 2: Buffered I/O for tail (if any)
+	if hasTail {
+		tailSize := size - alignedEnd
 
-	// Drop from page cache
-	if cfg.DropCache {
-		_ = adviseDontNeed(fd, 0, size)
+		fd, err := unix.Open(path, unix.O_WRONLY, 0) // no O_DIRECT
+		if err != nil {
+			return fmt.Errorf("open for wipe (tail): %w", err)
+		}
+
+		// Smaller buffer for tail - no alignment needed
+		tailBuf := buf
+		if int64(len(tailBuf)) > tailSize {
+			tailBuf = tailBuf[:tailSize]
+		}
+
+		for pass := 0; pass < cfg.Passes; pass++ {
+			if err := wipeRegion(ctx, tr, fd, alignedEnd, size, tailBuf, cfg, pass); err != nil {
+				unix.Close(fd)
+				return fmt.Errorf("wipe tail pass %d: %w", pass, err)
+			}
+		}
+
+		if err := syncFile(fd, true); err != nil {
+			unix.Close(fd)
+			return fmt.Errorf("fsync (tail): %w", err)
+		}
+
+		unix.Close(fd)
 	}
 
 	return nil
 }
 
-func wipePass(ctx context.Context, tr *tracer, fd int, size int64, buf []byte, cfg WipeConfig, pass int) error {
-	// Seek to start
-	if _, err := unix.Seek(fd, 0, unix.SEEK_SET); err != nil {
-		return fmt.Errorf("seek: %w", err)
-	}
-
+// wipeRegion wipes [start, end) of an already-open fd.
+func wipeRegion(ctx context.Context, tr *tracer, fd int, start, end int64, buf []byte, cfg WipeConfig, pass int) error {
 	// Fill function based on mode
 	var fill func([]byte, int) error
 	switch cfg.Mode {
@@ -415,32 +454,27 @@ func wipePass(ctx context.Context, tr *tracer, fd int, size int64, buf []byte, c
 		return fmt.Errorf("unsupported wipe mode: %v", cfg.Mode)
 	}
 
-	remaining := size
+	offset := start
 	chunks := 0
-	for remaining > 0 {
+	for offset < end {
 		n := int64(len(buf))
-		if remaining < n {
-			n = remaining
-			// For O_DIRECT, round up to alignment (but don't write past file)
-			if cfg.UseDirect {
-				n = (n + directAlign - 1) &^ (directAlign - 1)
-			}
+		if offset+n > end {
+			n = end - offset
 		}
 
 		if err := fill(buf[:n], pass); err != nil {
 			return fmt.Errorf("fill: %w", err)
 		}
 
-		// pwrite for position-independent I/O
-		written, err := unix.Pwrite(fd, buf[:n], size-remaining)
+		written, err := unix.Pwrite(fd, buf[:n], offset)
 		if err != nil {
-			return fmt.Errorf("pwrite: %w", err)
+			return fmt.Errorf("pwrite at %d: %w", offset, err)
 		}
-		if int64(written) != n && remaining >= n {
-			return fmt.Errorf("short write: %d/%d", written, n)
+		if int64(written) != n {
+			return fmt.Errorf("short write: %d/%d at offset %d", written, n, offset)
 		}
 
-		remaining -= int64(written)
+		offset += n
 		chunks++
 
 		// Periodic sync if configured
@@ -480,7 +514,7 @@ func wipePunchHole(ctx context.Context, tr *tracer, path string, size int64) err
 }
 
 // ============================================================================
-// SHA256 with O_DIRECT option
+// SHA256 with O_DIRECT option (dual-fd for tail safety)
 // ============================================================================
 
 func sha256File(ctx context.Context, tr *tracer, path string, useDirect bool, useMlock bool) ([32]byte, error) {
@@ -492,27 +526,35 @@ func sha256File(ctx context.Context, tr *tracer, path string, useDirect bool, us
 
 	var out [32]byte
 
-	flags := unix.O_RDONLY
-	if useDirect {
-		flags |= unix.O_DIRECT
-	}
-
-	fd, err := unix.Open(path, flags, 0)
+	// Get file size first (normal open)
+	stFd, err := unix.Open(path, unix.O_RDONLY, 0)
 	if err != nil {
-		return out, fmt.Errorf("open: %w", err)
+		return out, fmt.Errorf("open for stat: %w", err)
 	}
-	defer unix.Close(fd)
-
-	// Get size for advise
-	id, err := getFileIdentity(fd)
+	id, err := getFileIdentity(stFd)
+	unix.Close(stFd)
 	if err != nil {
 		return out, err
 	}
-	_ = adviseSequential(fd, 0, id.Size)
+	size := id.Size
+
+	if size == 0 {
+		// Empty file - just return hash of nothing
+		h := sha256.New()
+		copy(out[:], h.Sum(nil))
+		return out, nil
+	}
+
+	// O_DIRECT tail problem: read [0, alignedEnd) with O_DIRECT, [alignedEnd, size) buffered
+	alignedEnd := size
+	if useDirect {
+		alignedEnd = alignedPrefix(size, int64(directAlign))
+	}
+	hasTail := alignedEnd < size
 
 	// Allocate read buffer
-	bufSize := 1 << 20
-	if useDirect {
+	bufSize := 1 << 20 // 1MB
+	if useDirect && bufSize%directAlign != 0 {
 		bufSize = (bufSize + directAlign - 1) &^ (directAlign - 1)
 	}
 	buf, err := secureAlloc(bufSize, useMlock)
@@ -522,22 +564,78 @@ func sha256File(ctx context.Context, tr *tracer, path string, useDirect bool, us
 	defer secureFree(buf, useMlock)
 
 	h := sha256.New()
-	offset := int64(0)
-	for {
-		n, err := unix.Pread(fd, buf, offset)
-		if n > 0 {
+
+	// Phase 1: O_DIRECT for aligned region (if any)
+	if alignedEnd > 0 {
+		flags := unix.O_RDONLY
+		if useDirect {
+			flags |= unix.O_DIRECT
+		}
+
+		fd, err := unix.Open(path, flags, 0)
+		if err != nil {
+			return out, fmt.Errorf("open for hash (direct): %w", err)
+		}
+
+		_ = adviseSequential(fd, 0, alignedEnd)
+
+		offset := int64(0)
+		for offset < alignedEnd {
+			toRead := int64(len(buf))
+			if offset+toRead > alignedEnd {
+				toRead = alignedEnd - offset
+			}
+
+			n, err := unix.Pread(fd, buf[:toRead], offset)
+			if err != nil && !errors.Is(err, unix.EINTR) {
+				unix.Close(fd)
+				return out, fmt.Errorf("pread at %d: %w", offset, err)
+			}
+			if n == 0 {
+				break
+			}
+
 			h.Write(buf[:n])
 			offset += int64(n)
 		}
+
+		unix.Close(fd)
+	}
+
+	// Phase 2: Buffered read for tail (if any)
+	if hasTail {
+		fd, err := unix.Open(path, unix.O_RDONLY, 0) // no O_DIRECT
 		if err != nil {
-			if errors.Is(err, unix.EINTR) {
-				continue
+			return out, fmt.Errorf("open for hash (tail): %w", err)
+		}
+
+		tailSize := size - alignedEnd
+		tailBuf := buf
+		if int64(len(tailBuf)) > tailSize {
+			tailBuf = tailBuf[:tailSize]
+		}
+
+		offset := alignedEnd
+		for offset < size {
+			toRead := int64(len(tailBuf))
+			if offset+toRead > size {
+				toRead = size - offset
 			}
-			break
+
+			n, err := unix.Pread(fd, tailBuf[:toRead], offset)
+			if err != nil && !errors.Is(err, unix.EINTR) {
+				unix.Close(fd)
+				return out, fmt.Errorf("pread tail at %d: %w", offset, err)
+			}
+			if n == 0 {
+				break
+			}
+
+			h.Write(tailBuf[:n])
+			offset += int64(n)
 		}
-		if n == 0 {
-			break
-		}
+
+		unix.Close(fd)
 	}
 
 	copy(out[:], h.Sum(nil))
@@ -711,7 +809,7 @@ func readLastDigest(journalPath string) ([16]byte, error) {
 	return out, nil
 }
 
-func appendRecord(ctx context.Context, tr *tracer, jf *os.File, r commitRecord) error {
+func appendRecord(ctx context.Context, tr *tracer, jf *os.File, r *commitRecord) error {
 	ctx, sp := tr.Start(ctx, "journal.append", map[string]string{"target": r.TargetPath})
 	defer sp.End()
 
@@ -774,14 +872,14 @@ func appendRecord(ctx context.Context, tr *tracer, jf *os.File, r commitRecord) 
 	binary.LittleEndian.PutUint32(raw[headerLenPos:], headerLen)
 	binary.LittleEndian.PutUint32(raw[bodyLenPos:], bodyLen)
 
-	// CRC of everything
-	crc := crc32.ChecksumIEEE(raw)
+	// CRC of everything - populate struct field for envelope/verification
+	r.RecordCRC32 = crc32.ChecksumIEEE(raw)
 
 	// Write record + CRC
 	if _, err := jf.Write(raw); err != nil {
 		return err
 	}
-	if err := binary.Write(jf, binary.LittleEndian, crc); err != nil {
+	if err := binary.Write(jf, binary.LittleEndian, r.RecordCRC32); err != nil {
 		return err
 	}
 
@@ -1124,7 +1222,7 @@ func main() {
 		BeforeHash: before,
 		AfterHash:  after,
 	}
-	if err := appendRecord(ctx, tr, jf, rec); err != nil {
+	if err := appendRecord(ctx, tr, jf, &rec); err != nil {
 		log.Fatalf("append record: %v", err)
 	}
 
@@ -1168,12 +1266,13 @@ func main() {
 			"after_b64":   base64.StdEncoding.EncodeToString(after[:]),
 			"prev16_hex":  hex.EncodeToString(prevDigest[:]),
 			"curr16_hex":  hex.EncodeToString(currDigest[:]),
+			"rec_crc32":   fmt.Sprintf("%08x", rec.RecordCRC32),
 			"journal":     jpath,
 		}
 		b, _ := json.Marshal(env)
 		fmt.Println(base64.StdEncoding.EncodeToString(b))
 	}
 
-	log.Printf("ok path=%s size=%d inode=%d digest=%s",
-		absPath, id.Size, id.Inode, hex.EncodeToString(currDigest[:]))
+	log.Printf("ok path=%s size=%d inode=%d digest=%s crc=%08x",
+		absPath, id.Size, id.Inode, hex.EncodeToString(currDigest[:]), rec.RecordCRC32)
 }
