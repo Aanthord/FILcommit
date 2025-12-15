@@ -1,0 +1,318 @@
+  name: ddc-double-clang-double-go-final
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  LLVM_VERSION: "18.1.8"
+  GO_VERSION: "1.22.6"
+  BUILD_TYPE: "Release"
+
+  TZ: "UTC"
+  LC_ALL: "C"
+  LANG: "C"
+  SOURCE_DATE_EPOCH: "1734220800" # 2025-12-15 00:00:00 UTC
+  OUTDIR: "${{ github.workspace }}/out"
+
+jobs:
+  lane_a_ubuntu:
+    name: laneA (ubuntu) - canonical build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential ninja-build cmake python3 git curl ca-certificates \
+            zlib1g-dev libxml2-dev libncurses5-dev libssl-dev pkg-config
+
+      - name: Prep dirs
+        run: |
+          mkdir -p "${OUTDIR}/laneA" "${OUTDIR}/src"
+
+      - name: Fetch LLVM source (pinned)
+        working-directory: ${{ env.OUTDIR }}/src
+        run: |
+          set -euo pipefail
+          curl -L -o llvm-project.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz"
+          tar -xf llvm-project.tar.xz
+          mv "llvm-project-${LLVM_VERSION}.src" llvm-project
+
+      - name: Build LLVM/Clang stage1
+        run: |
+          set -euo pipefail
+          SRC="${OUTDIR}/src/llvm-project"
+          B1="${OUTDIR}/laneA/llvm-stage1"
+          I1="${OUTDIR}/laneA/llvm-stage1-install"
+          mkdir -p "$B1" "$I1"
+          cmake -S "$SRC/llvm" -B "$B1" -G Ninja \
+            -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=ON \
+            -DCMAKE_INSTALL_PREFIX="$I1"
+          ninja -C "$B1"
+          ninja -C "$B1" install
+
+      - name: Build LLVM/Clang stage2 (using stage1 clang)
+        run: |
+          set -euo pipefail
+          SRC="${OUTDIR}/src/llvm-project"
+          B2="${OUTDIR}/laneA/llvm-stage2"
+          I2="${OUTDIR}/laneA/llvm-stage2-install"
+          CC="${OUTDIR}/laneA/llvm-stage1-install/bin/clang"
+          CXX="${OUTDIR}/laneA/llvm-stage1-install/bin/clang++"
+          mkdir -p "$B2" "$I2"
+          cmake -S "$SRC/llvm" -B "$B2" -G Ninja \
+            -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=ON \
+            -DCMAKE_INSTALL_PREFIX="$I2" \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX"
+          ninja -C "$B2"
+          ninja -C "$B2" install
+
+      - name: Record clang hashes (laneA)
+        run: |
+          set -euo pipefail
+          sha256sum "${OUTDIR}/laneA/llvm-stage2-install/bin/clang" | tee "${OUTDIR}/laneA/clang.sha256"
+          "${OUTDIR}/laneA/llvm-stage2-install/bin/clang" --version | tee "${OUTDIR}/laneA/clang.version"
+
+      - name: Fetch Go source (pinned)
+        working-directory: ${{ env.OUTDIR }}/src
+        run: |
+          set -euo pipefail
+          curl -L -o go.tar.gz "https://go.dev/dl/go${GO_VERSION}.src.tar.gz"
+          tar -xf go.tar.gz
+          mv go "go-${GO_VERSION}"
+
+      - name: Build Go stage1 (bootstrap) using laneA stage2 clang
+        run: |
+          set -euo pipefail
+          GOSRC="${OUTDIR}/src/go-${GO_VERSION}"
+          export CC="${OUTDIR}/laneA/llvm-stage2-install/bin/clang"
+          export CXX="${OUTDIR}/laneA/llvm-stage2-install/bin/clang++"
+          cd "$GOSRC/src"
+          ./make.bash
+          mkdir -p "${OUTDIR}/laneA/go-stage1"
+          cp -a "$GOSRC" "${OUTDIR}/laneA/go-stage1"
+
+      - name: Build Go stage2 (rebuild using stage1)
+        run: |
+          set -euo pipefail
+          G1="${OUTDIR}/laneA/go-stage1"
+          export GOROOT_BOOTSTRAP="$G1"
+          export PATH="$G1/bin:$PATH"
+          export CC="${OUTDIR}/laneA/llvm-stage2-install/bin/clang"
+          export CXX="${OUTDIR}/laneA/llvm-stage2-install/bin/clang++"
+          cp -a "${OUTDIR}/src/go-${GO_VERSION}" "${OUTDIR}/laneA/go-stage2"
+          cd "${OUTDIR}/laneA/go-stage2/src"
+          ./make.bash
+
+      - name: Record go hashes (laneA)
+        run: |
+          set -euo pipefail
+          "${OUTDIR}/laneA/go-stage2/bin/go" version | tee "${OUTDIR}/laneA/go.version"
+          sha256sum "${OUTDIR}/laneA/go-stage2/bin/go" | tee "${OUTDIR}/laneA/go.sha256"
+
+      - name: Build canonical target (laneA Go) — THIS IS THE SHIPPED BINARY
+        run: |
+          set -euo pipefail
+          export PATH="${OUTDIR}/laneA/go-stage2/bin:$PATH"
+          mkdir -p "${OUTDIR}/laneA/target"
+          go build -trimpath -buildvcs=false -o "${OUTDIR}/laneA/target/filcommit-linux-amd64" ./cmd/filcommit
+          sha256sum "${OUTDIR}/laneA/target/filcommit-linux-amd64" | tee "${OUTDIR}/laneA/target/filcommit.sha256"
+
+      - name: Upload laneA artifacts (includes canonical binary)
+        uses: actions/upload-artifact@v4
+        with:
+          name: laneA-artifacts
+          path: ${{ env.OUTDIR }}/laneA
+
+  lane_b_debian:
+    name: laneB (debian container) - witness build
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:12
+    steps:
+      - name: Install deps
+        run: |
+          apt-get update
+          apt-get install -y \
+            git curl ca-certificates \
+            build-essential ninja-build cmake python3 \
+            zlib1g-dev libxml2-dev libncurses-dev libssl-dev pkg-config
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Prep dirs
+        run: |
+          mkdir -p "${OUTDIR}/laneB" "${OUTDIR}/src"
+
+      - name: Fetch LLVM source (pinned)
+        working-directory: ${{ env.OUTDIR }}/src
+        run: |
+          set -euo pipefail
+          curl -L -o llvm-project.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz"
+          tar -xf llvm-project.tar.xz
+          mv "llvm-project-${LLVM_VERSION}.src" llvm-project
+
+      - name: Build LLVM/Clang stage1
+        run: |
+          set -euo pipefail
+          SRC="${OUTDIR}/src/llvm-project"
+          B1="${OUTDIR}/laneB/llvm-stage1"
+          I1="${OUTDIR}/laneB/llvm-stage1-install"
+          mkdir -p "$B1" "$I1"
+          cmake -S "$SRC/llvm" -B "$B1" -G Ninja \
+            -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=ON \
+            -DCMAKE_INSTALL_PREFIX="$I1"
+          ninja -C "$B1"
+          ninja -C "$B1" install
+
+      - name: Build LLVM/Clang stage2 (using stage1 clang)
+        run: |
+          set -euo pipefail
+          SRC="${OUTDIR}/src/llvm-project"
+          B2="${OUTDIR}/laneB/llvm-stage2"
+          I2="${OUTDIR}/laneB/llvm-stage2-install"
+          CC="${OUTDIR}/laneB/llvm-stage1-install/bin/clang"
+          CXX="${OUTDIR}/laneB/llvm-stage1-install/bin/clang++"
+          mkdir -p "$B2" "$I2"
+          cmake -S "$SRC/llvm" -B "$B2" -G Ninja \
+            -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=ON \
+            -DCMAKE_INSTALL_PREFIX="$I2" \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX"
+          ninja -C "$B2"
+          ninja -C "$B2" install
+
+      - name: Fetch Go bootstrap binary (pinned)
+        run: |
+          set -euo pipefail
+          curl -L -o go-bootstrap.tar.gz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
+          tar -C /usr/local -xzf go-bootstrap.tar.gz
+          /usr/local/go/bin/go version
+
+      - name: Fetch Go source (pinned)
+        working-directory: ${{ env.OUTDIR }}/src
+        run: |
+          set -euo pipefail
+          curl -L -o go.tar.gz "https://go.dev/dl/go${GO_VERSION}.src.tar.gz"
+          tar -xf go.tar.gz
+          mv go "go-${GO_VERSION}"
+
+      - name: Build Go stage1 using laneB stage2 clang
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/go/bin:$PATH"
+          GOSRC="${OUTDIR}/src/go-${GO_VERSION}"
+          export CC="${OUTDIR}/laneB/llvm-stage2-install/bin/clang"
+          export CXX="${OUTDIR}/laneB/llvm-stage2-install/bin/clang++"
+          cd "$GOSRC/src"
+          ./make.bash
+          mkdir -p "${OUTDIR}/laneB/go-stage1"
+          cp -a "$GOSRC" "${OUTDIR}/laneB/go-stage1"
+
+      - name: Build Go stage2 (rebuild using stage1)
+        run: |
+          set -euo pipefail
+          G1="${OUTDIR}/laneB/go-stage1"
+          export GOROOT_BOOTSTRAP="$G1"
+          export PATH="$G1/bin:$PATH"
+          export CC="${OUTDIR}/laneB/llvm-stage2-install/bin/clang"
+          export CXX="${OUTDIR}/laneB/llvm-stage2-install/bin/clang++"
+          cp -a "${OUTDIR}/src/go-${GO_VERSION}" "${OUTDIR}/laneB/go-stage2"
+          cd "${OUTDIR}/laneB/go-stage2/src"
+          ./make.bash
+
+      - name: Build witness target (laneB Go)
+        run: |
+          set -euo pipefail
+          export PATH="${OUTDIR}/laneB/go-stage2/bin:$PATH"
+          mkdir -p "${OUTDIR}/laneB/target"
+          go build -trimpath -buildvcs=false -o "${OUTDIR}/laneB/target/filcommit-linux-amd64" ./cmd/filcommit
+          sha256sum "${OUTDIR}/laneB/target/filcommit-linux-amd64" | tee "${OUTDIR}/laneB/target/filcommit.sha256"
+
+      - name: Upload laneB artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: laneB-artifacts
+          path: ${{ env.OUTDIR }}/laneB
+
+  compare_and_publish:
+    name: compare gate + publish canonical binary
+    runs-on: ubuntu-24.04
+    needs: [lane_a_ubuntu, lane_b_debian]
+    steps:
+      - name: Download laneA artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: laneA-artifacts
+          path: out/laneA
+
+      - name: Download laneB artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: laneB-artifacts
+          path: out/laneB
+
+      - name: Compare filcommit hashes (STRICT)
+        run: |
+          set -euo pipefail
+          A="$(cut -d' ' -f1 out/laneA/target/filcommit.sha256)"
+          B="$(cut -d' ' -f1 out/laneB/target/filcommit.sha256)"
+
+          echo "laneA filcommit: $A"
+          echo "laneB filcommit: $B"
+
+          if [[ "$A" != "$B" ]]; then
+            echo "FATAL: filcommit mismatch across lanes"
+            echo "This is either nondeterminism or compromise. Treat as hostile until explained."
+            exit 1
+          fi
+
+          echo "OK: filcommit matched across lanes."
+
+      - name: Write provenance note
+        run: |
+          set -euo pipefail
+          A="$(cat out/laneA/target/filcommit.sha256)"
+          {
+            echo "Canonical lane: laneA (ubuntu-24.04)"
+            echo "Witness lane:   laneB (debian:12 container)"
+            echo
+            echo "filcommit sha256:"
+            echo "$A"
+          } | tee out/PROVENANCE.txt
+
+      - name: Upload final canonical binary (laneA)
+        uses: actions/upload-artifact@v4
+        with:
+          name: filcommit-linux-amd64
+          path: |
+            out/laneA/target/filcommit-linux-amd64
+            out/PROVENANCE.txt
